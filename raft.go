@@ -8,6 +8,7 @@ import (
 type Raft struct {
 	state        RaftState
 	config       *Config
+	rpcCh        chan *RPC
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 }
@@ -48,11 +49,26 @@ func (r *Raft) runFollower() {
 	for {
 		log.Print("run follower")
 		select {
+		case rpc := <-r.rpcCh:
+			switch rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				return
+			case *RequestVoteRequest:
+				return
+			default:
+				log.Printf("follower unexpected type %#v", rpc.Command)
+			}
+		case <-randomTimeout(r.config.HeartbeatTimeout):
+			// 時間切れでcandidateへstateの変更
+			r.state = Candidate
 		case <-r.shutdownCh:
 			return
 		}
 	}
 }
+
+func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest)      {}
+func (r *Raft) followerRequestVoteRequest(rpc RPC, a *AppendEntriesRequest) {}
 
 func (r *Raft) runCandidate() {
 	for {
