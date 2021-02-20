@@ -6,4 +6,4 @@ const (
 	Leader
 )
 
-type RaftState int32
+type RaftState int64

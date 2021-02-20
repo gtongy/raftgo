@@ -8,7 +8,10 @@ import (
 type Raft struct {
 	state        RaftState
 	config       *Config
-	rpcCh        chan *RPC
+	lastLog      int64
+	logs         LogStore
+	currentTerm  int64
+	rpcCh        chan RPC
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 }
@@ -50,8 +53,9 @@ func (r *Raft) runFollower() {
 		log.Print("run follower")
 		select {
 		case rpc := <-r.rpcCh:
-			switch rpc.Command.(type) {
+			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
+				r.followerAppendEntries(rpc, cmd)
 				return
 			case *RequestVoteRequest:
 				return
@@ -67,7 +71,43 @@ func (r *Raft) runFollower() {
 	}
 }
 
-func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest)      {}
+func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
+	resp := &AppendEntriesResponse{
+		Term:    r.currentTerm,
+		Success: false,
+	}
+	// old term skip
+	if a.Term < r.currentTerm {
+		return
+	}
+	if a.Term > r.currentTerm {
+		r.currentTerm = a.Term
+		resp.Term = a.Term
+	}
+	var prevLog Log
+	if err := r.logs.GetLog(a.PrevLogIndex, &prevLog); err != nil {
+		log.Printf("failed to get prev log: %d %v", a.PrevLogIndex, err)
+		return
+	}
+	if a.PrevLogTerm != prevLog.Term {
+		log.Printf("prev log term mis match: ours: %d remote: %v", prevLog.Term, a.PrevLogTerm)
+		return
+	}
+	for _, entry := range a.Entries {
+		if entry.Index <= r.lastLog {
+			log.Printf("clear log suffix from %d to %d", entry.Index, r.lastLog)
+			if err := r.logs.DeleteRange(entry.Index, r.lastLog); err != nil {
+				log.Printf("fail to clear log")
+				return
+			}
+		}
+		if err := r.logs.StoreLog(entry); err != nil {
+			log.Printf("fail to append to log: %v", err)
+			return
+		}
+		r.lastLog = entry.Index
+	}
+}
 func (r *Raft) followerRequestVoteRequest(rpc RPC, a *AppendEntriesRequest) {}
 
 func (r *Raft) runCandidate() {

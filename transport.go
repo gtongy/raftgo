@@ -1,24 +1,25 @@
 package main
 
 type AppendEntriesRequest struct {
-	Term         int32
+	Term         int64
 	LeaderID     int64
-	PrevLogIndex int32
-	PrevLogTerm  int32
-	LeaderCommit int32
+	PrevLogIndex int64
+	PrevLogTerm  int64
+	Entries      []*Log
+	LeaderCommit int64
 }
 type AppendEntriesResponse struct {
-	Term    int32
+	Term    int64
 	Success bool
 }
 type RequestVoteRequest struct {
-	Term         int32
-	CandidateID  int32
-	LastLogIndex int32
-	LastLogTerm  int32
+	Term         int64
+	CandidateID  int64
+	LastLogIndex int64
+	LastLogTerm  int64
 }
 type RequestVoteResponse struct {
-	Term        int32
+	Term        int64
 	VoteGranted bool
 }
 
