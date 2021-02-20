@@ -3,12 +3,14 @@ package main
 import "fmt"
 
 type Raft struct {
-	state RaftState
+	state  RaftState
+	config *Config
 }
 
 func NewRaft() (*Raft, error) {
 	r := &Raft{
-		state: Follower,
+		state:  Follower,
+		config: DefaultConfig(),
 	}
 	r.run()
 	return r, nil
