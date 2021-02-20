@@ -1,43 +1,84 @@
 package main
 
-import "fmt"
+import (
+	"log"
+	"sync"
+)
 
 type Raft struct {
-	state  RaftState
-	config *Config
+	state        RaftState
+	config       *Config
+	shutdownCh   chan struct{}
+	shutdownLock sync.Mutex
 }
 
 func NewRaft() (*Raft, error) {
 	r := &Raft{
-		state:  Follower,
-		config: DefaultConfig(),
+		state:      Follower,
+		config:     DefaultConfig(),
+		shutdownCh: make(chan struct{}),
 	}
-	r.run()
+	go r.run()
 	return r, nil
 }
 
+func (r *Raft) GetState() RaftState {
+	return r.state
+}
+
 func (r *Raft) run() {
-	switch r.state {
-	case Follower:
-		r.runFollower()
-	case Candidate:
-		r.runCandidate()
-	case Leader:
-		r.runLeader()
+	for {
+		select {
+		case <-r.shutdownCh:
+			return
+		default:
+		}
+		switch r.state {
+		case Follower:
+			r.runFollower()
+		case Candidate:
+			r.runCandidate()
+		case Leader:
+			r.runLeader()
+		}
 	}
 }
 
 func (r *Raft) runFollower() {
-	fmt.Println("run follower")
-	// follower logic
+	for {
+		log.Print("run follower")
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 func (r *Raft) runCandidate() {
-	fmt.Println("run candidate")
-	// candidate logic
+	for {
+		log.Print("run candidate")
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 func (r *Raft) runLeader() {
-	fmt.Println("run leader")
-	// leader logic
+	for {
+		log.Print("run leader")
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+func (r *Raft) Shutdown() {
+	r.shutdownLock.Lock()
+	defer r.shutdownLock.Unlock()
+	if r.shutdownCh != nil {
+		close(r.shutdownCh)
+		r.shutdownCh = nil
+	}
 }
