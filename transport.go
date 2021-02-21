@@ -1,5 +1,10 @@
 package main
 
+type RPCResponse struct {
+	Response interface{}
+	Error    error
+}
+
 type AppendEntriesRequest struct {
 	Term         uint64
 	LeaderID     uint64
@@ -24,5 +29,14 @@ type RequestVoteResponse struct {
 }
 
 type RPC struct {
-	Command interface{}
+	Command  interface{}
+	RespChan chan<- RPCResponse
+}
+
+func (r *RPC) Respond(resp interface{}, err error) {
+	r.RespChan <- RPCResponse{resp, err}
+}
+
+type Transport interface {
+	Consumer() <-chan RPC
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"sync"
 )
 
@@ -18,13 +19,14 @@ type Raft struct {
 	lastLog      uint64
 	logs         LogStore
 	currentTerm  uint64
-	rpcCh        chan RPC
+	peers        []net.Addr
+	trans        Transport
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 	stable       StableStore
 }
 
-func NewRaft(stable StableStore, logs LogStore) (*Raft, error) {
+func NewRaft(stable StableStore, logs LogStore, trans Transport) (*Raft, error) {
 	lastLog, err := logs.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to find last log: %v", err)
@@ -35,11 +37,14 @@ func NewRaft(stable StableStore, logs LogStore) (*Raft, error) {
 	}
 	r := &Raft{
 		state:       Follower,
-		lastLog:     lastLog,
 		config:      DefaultConfig(),
-		stable:      stable,
+		lastLog:     lastLog,
+		logs:        logs,
 		currentTerm: currentTerm,
+		peers:       make([]net.Addr, 0, 5),
+		trans:       trans,
 		shutdownCh:  make(chan struct{}),
+		stable:      stable,
 	}
 	go r.run()
 	return r, nil
@@ -50,6 +55,7 @@ func (r *Raft) GetState() RaftState {
 }
 
 func (r *Raft) run() {
+	ch := r.trans.Consumer()
 	for {
 		select {
 		case <-r.shutdownCh:
@@ -58,45 +64,22 @@ func (r *Raft) run() {
 		}
 		switch r.state {
 		case Follower:
-			r.runFollower()
+			r.runFollower(ch)
 		case Candidate:
-			r.runCandidate()
+			r.runCandidate(ch)
 		case Leader:
 			r.runLeader()
 		}
 	}
 }
 
-func (r *Raft) runFollower() {
-	for {
-		log.Print("run follower")
-		select {
-		case rpc := <-r.rpcCh:
-			switch cmd := rpc.Command.(type) {
-			case *AppendEntriesRequest:
-				r.followerAppendEntries(rpc, cmd)
-				return
-			case *RequestVoteRequest:
-				r.followerRequestVote(rpc, cmd)
-				return
-			default:
-				log.Printf("follower unexpected type %#v", rpc.Command)
-			}
-		case <-randomTimeout(r.config.HeartbeatTimeout):
-			// 時間切れでcandidateへstateの変更
-			r.state = Candidate
-		case <-r.shutdownCh:
-			return
-		}
-	}
-}
-
-func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
+func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	resp := &AppendEntriesResponse{
 		Term:    r.currentTerm,
 		Success: false,
 	}
-	// TODO: respond
+	var rpcErr error
+	defer rpc.Respond(resp, rpcErr)
 	// old term skip
 	if a.Term < r.currentTerm {
 		return
@@ -129,12 +112,14 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.lastLog = entry.Index
 	}
 }
-func (r *Raft) followerRequestVote(rpc RPC, req *RequestVoteRequest) {
+
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	resp := &RequestVoteResponse{
 		Term:        r.currentTerm,
 		VoteGranted: false,
 	}
-	// TODO: respond
+	var rpcErr error
+	defer rpc.Respond(resp, rpcErr)
 	// old term skip
 	if req.Term < r.currentTerm {
 		return
@@ -192,10 +177,59 @@ func (r *Raft) followerRequestVote(rpc RPC, req *RequestVoteRequest) {
 	resp.VoteGranted = true
 }
 
-func (r *Raft) runCandidate() {
+func (r *Raft) runFollower(ch <-chan RPC) {
 	for {
-		log.Print("run candidate")
+		log.Print("run follower")
 		select {
+		case rpc := <-ch:
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				r.appendEntries(rpc, cmd)
+				return
+			case *RequestVoteRequest:
+				r.requestVote(rpc, cmd)
+				return
+			default:
+				log.Printf("follower unexpected type %#v", rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
+		case <-randomTimeout(r.config.HeartbeatTimeout):
+			// 時間切れでcandidateへstateの変更
+			r.state = Candidate
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+func (r *Raft) runCandidate(ch <-chan RPC) {
+	log.Print("run candidate")
+	// elect self
+	electionTimer := randomTimeout(r.config.ElectionTimeout)
+	// TODO vote logic
+	clusterSize := len(r.peers) + 1
+	votesNeeded := (clusterSize >> 1) + 1
+	log.Printf("cluster size: %d, votes needed: %d", clusterSize, votesNeeded)
+	transition := false
+	for !transition {
+		select {
+		case rpc := <-ch:
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				r.appendEntries(rpc, cmd)
+				return
+			case *RequestVoteRequest:
+				r.requestVote(rpc, cmd)
+				return
+			default:
+				log.Printf("follower unexpected type %#v", rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
+		case <-electionTimer:
+			// Election failed! Restart the elction. We simply return
+			log.Printf("election timeout reached, restarting election")
+			return
+
 		case <-r.shutdownCh:
 			return
 		}
