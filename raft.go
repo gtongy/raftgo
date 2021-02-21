@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -90,23 +91,23 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}
 	var prevLog Log
 	if err := r.logs.GetLog(a.PrevLogIndex, &prevLog); err != nil {
-		log.Printf("failed to get prev log: %d %v", a.PrevLogIndex, err)
+		logrus.Printf("failed to get prev log: %d %v", a.PrevLogIndex, err)
 		return
 	}
 	if a.PrevLogTerm != prevLog.Term {
-		log.Printf("prev log term mis match: ours: %d remote: %v", prevLog.Term, a.PrevLogTerm)
+		logrus.Printf("prev log term mis match: ours: %d remote: %v", prevLog.Term, a.PrevLogTerm)
 		return
 	}
 	for _, entry := range a.Entries {
 		if entry.Index <= r.lastLog {
-			log.Printf("clear log suffix from %d to %d", entry.Index, r.lastLog)
+			logrus.Printf("clear log suffix from %d to %d", entry.Index, r.lastLog)
 			if err := r.logs.DeleteRange(entry.Index, r.lastLog); err != nil {
-				log.Printf("fail to clear log")
+				logrus.Printf("fail to clear log")
 				return
 			}
 		}
 		if err := r.logs.StoreLog(entry); err != nil {
-			log.Printf("fail to append to log: %v", err)
+			logrus.Printf("fail to append to log: %v", err)
 			return
 		}
 		r.lastLog = entry.Index
@@ -132,19 +133,19 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// check voted
 	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
 	if err != nil && err.Error() != "not found" {
-		log.Printf("fail to get last vote %v", err)
+		logrus.Printf("fail to get last vote %v", err)
 		return
 	}
 	lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
 	if err != nil && err.Error() != "not found" {
-		log.Printf("fail to get last vote candidate %v", err)
+		logrus.Printf("fail to get last vote candidate %v", err)
 		return
 	}
 	// check voted in this election before
 	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
-		log.Printf("duplicate RequestVote for same term %d", req.Term)
+		logrus.Printf("duplicate RequestVote for same term %d", req.Term)
 		if string(lastVoteCandBytes) == req.CandidateID {
-			log.Printf("duplicate RequestVote from candidate: %s", req.CandidateID)
+			logrus.Printf("duplicate RequestVote from candidate: %s", req.CandidateID)
 			resp.VoteGranted = true
 		}
 		return
@@ -152,26 +153,26 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	if r.lastLog > 0 {
 		var lastLog Log
 		if err := r.logs.GetLog(r.lastLog, &lastLog); err != nil {
-			log.Printf("fail to get last log %v", err)
+			logrus.Printf("fail to get last log %v", err)
 			return
 		}
 		if lastLog.Term > req.LastLogTerm {
-			log.Printf("reject vote since our last term is greater")
+			logrus.Printf("reject vote since our last term is greater")
 			return
 		}
 		if lastLog.Index > req.LastLogIndex {
-			log.Printf("reject vote since our last index is greater")
+			logrus.Printf("reject vote since our last index is greater")
 			return
 		}
 	}
 
 	// Seems we should grant a vote
 	if err := r.stable.SetUint64(keyLastVoteTerm, req.Term); err != nil {
-		log.Printf("[ERR] Failed to persist last vote term: %v", err)
+		logrus.Printf("[ERR] Failed to persist last vote term: %v", err)
 		return
 	}
 	if err := r.stable.Set(keyLastVoteCand, []byte(req.CandidateID)); err != nil {
-		log.Printf("[ERR] Failed to persist last vote candidate: %v", err)
+		logrus.Printf("[ERR] Failed to persist last vote candidate: %v", err)
 		return
 	}
 	resp.VoteGranted = true
@@ -179,7 +180,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 func (r *Raft) runFollower(ch <-chan RPC) {
 	for {
-		log.Print("run follower")
+		logrus.Print("run follower")
 		select {
 		case rpc := <-ch:
 			switch cmd := rpc.Command.(type) {
@@ -190,7 +191,7 @@ func (r *Raft) runFollower(ch <-chan RPC) {
 				r.requestVote(rpc, cmd)
 				return
 			default:
-				log.Printf("follower unexpected type %#v", rpc.Command)
+				logrus.Printf("follower unexpected type %#v", rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 		case <-randomTimeout(r.config.HeartbeatTimeout):
@@ -203,13 +204,13 @@ func (r *Raft) runFollower(ch <-chan RPC) {
 }
 
 func (r *Raft) runCandidate(ch <-chan RPC) {
-	log.Print("run candidate")
-	// elect self
+	logrus.Print("run candidate")
+	voteCh := r.electSelf()
 	electionTimer := randomTimeout(r.config.ElectionTimeout)
-	// TODO vote logic
+	grantedVotes := 0
 	clusterSize := len(r.peers) + 1
 	votesNeeded := (clusterSize >> 1) + 1
-	log.Printf("cluster size: %d, votes needed: %d", clusterSize, votesNeeded)
+	logrus.Printf("cluster size: %d, votes needed: %d", clusterSize, votesNeeded)
 	transition := false
 	for !transition {
 		select {
@@ -222,12 +223,32 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 				r.requestVote(rpc, cmd)
 				return
 			default:
-				log.Printf("follower unexpected type %#v", rpc.Command)
+				logrus.Printf("follower unexpected type %#v", rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
+		case vote := <-voteCh:
+			// termの確認
+			if vote.Term > r.getCurrentTerm() {
+				logrus.Printf("newer term discovered")
+				r.state = Follower
+				if err := r.setCurrentTerm(vote.Term); err != nil {
+					logrus.Printf("fail to update current term: %v", err)
+				}
+				return
+			}
+			// grantedな投票の票数確認
+			if vote.VoteGranted {
+				grantedVotes++
+				logrus.Printf("vote granted. tally: %d", grantedVotes)
+			}
+
+			// 過半数表を得ているか。leaderになり得るか
+			if grantedVotes >= votesNeeded {
+				logrus.Printf("election won. tally: %d", grantedVotes)
+				r.state = Leader
+			}
 		case <-electionTimer:
-			// Election failed! Restart the elction. We simply return
-			log.Printf("election timeout reached, restarting election")
+			logrus.Printf("election timeout reached, restarting election")
 			return
 
 		case <-r.shutdownCh:
@@ -238,7 +259,7 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 
 func (r *Raft) runLeader() {
 	for {
-		log.Print("run leader")
+		logrus.Print("run leader")
 		select {
 		case <-r.shutdownCh:
 			return
@@ -253,4 +274,58 @@ func (r *Raft) Shutdown() {
 		close(r.shutdownCh)
 		r.shutdownCh = nil
 	}
+}
+
+// send RequestVote RPC to all peers, and vote for ourself
+func (r *Raft) electSelf() <-chan *RequestVoteResponse {
+	respCh := make(chan *RequestVoteResponse, len(r.peers)+1)
+	var lastLog Log
+	if r.lastLog > 0 {
+		if err := r.logs.GetLog(r.lastLog, &lastLog); err != nil {
+			logrus.Printf("failed to get last log: %d %v", r.lastLog, err)
+			return nil
+		}
+	}
+	// increment term
+	if err := r.setCurrentTerm(r.currentTerm + 1); err != nil {
+		logrus.Printf("fail to get last log: %d %v", r.lastLog, err)
+		return nil
+	}
+	req := &RequestVoteRequest{
+		Term:         r.getCurrentTerm(),
+		CandidateID:  r.CandidateID(),
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
+	}
+
+	askPeer := func(peer net.Addr) {
+		resp := new(RequestVoteResponse)
+		err := r.trans.RequestVote(peer, req, resp)
+		if err != nil {
+			logrus.Printf("failed to make RequestVote RPC to %v: %v", peer, err)
+			resp.Term = req.Term
+			resp.VoteGranted = false
+		}
+		respCh <- resp
+	}
+	for _, peer := range r.peers {
+		go askPeer(peer)
+	}
+
+	respCh <- &RequestVoteResponse{Term: req.Term, VoteGranted: true}
+	return respCh
+}
+
+func (r *Raft) setCurrentTerm(t uint64) error {
+	r.currentTerm = t
+	return nil
+}
+
+func (r *Raft) getCurrentTerm() uint64 {
+	return r.currentTerm
+}
+
+func (r *Raft) CandidateID() string {
+	// TODO
+	return "uuid"
 }

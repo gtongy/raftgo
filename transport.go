@@ -1,5 +1,7 @@
 package main
 
+import "net"
+
 type RPCResponse struct {
 	Response interface{}
 	Error    error
@@ -39,4 +41,5 @@ func (r *RPC) Respond(resp interface{}, err error) {
 
 type Transport interface {
 	Consumer() <-chan RPC
+	RequestVote(peer net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error
 }

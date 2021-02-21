@@ -7,10 +7,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	r, err := NewRaft(store, store)
+	trans := NewInmemTransport()
+	r, err := NewRaft(store, store, trans)
 	if err != nil {
 		panic(err)
 	}
 	defer r.Shutdown()
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 }

@@ -5,7 +5,9 @@ go 1.13
 require (
 	github.com/DataDog/datadog-go v4.4.0+incompatible // indirect
 	github.com/google/uuid v1.2.0 // indirect
+	github.com/kr/pretty v0.2.1
 	github.com/philhofer/fwd v1.1.1 // indirect
+	github.com/sirupsen/logrus v1.8.0
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/ugorji/go/codec v1.2.4
