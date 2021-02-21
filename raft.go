@@ -15,7 +15,7 @@ var (
 )
 
 type Raft struct {
-	state        RaftState
+	raftState
 	config       *Config
 	lastLog      uint64
 	logs         LogStore
@@ -23,6 +23,7 @@ type Raft struct {
 	peers        []net.Addr
 	trans        Transport
 	shutdownCh   chan struct{}
+	rpcCh        chan RPC
 	shutdownLock sync.Mutex
 	stable       StableStore
 }
@@ -37,7 +38,6 @@ func NewRaft(stable StableStore, logs LogStore, trans Transport) (*Raft, error) 
 		return nil, err
 	}
 	r := &Raft{
-		state:       Follower,
 		config:      DefaultConfig(),
 		lastLog:     lastLog,
 		logs:        logs,
@@ -47,27 +47,25 @@ func NewRaft(stable StableStore, logs LogStore, trans Transport) (*Raft, error) 
 		shutdownCh:  make(chan struct{}),
 		stable:      stable,
 	}
+	r.setState(Follower)
+	r.setCurrentTerm(currentTerm)
+	r.setLastLog(lastLog)
 	go r.run()
 	return r, nil
 }
 
-func (r *Raft) GetState() RaftState {
-	return r.state
-}
-
 func (r *Raft) run() {
-	ch := r.trans.Consumer()
 	for {
 		select {
 		case <-r.shutdownCh:
 			return
 		default:
 		}
-		switch r.state {
+		switch r.getState() {
 		case Follower:
-			r.runFollower(ch)
+			r.runFollower()
 		case Candidate:
-			r.runCandidate(ch)
+			r.runCandidate()
 		case Leader:
 			r.runLeader()
 		}
@@ -178,11 +176,11 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	resp.VoteGranted = true
 }
 
-func (r *Raft) runFollower(ch <-chan RPC) {
+func (r *Raft) runFollower() {
 	for {
 		logrus.Print("run follower")
 		select {
-		case rpc := <-ch:
+		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
 				r.appendEntries(rpc, cmd)
@@ -196,14 +194,14 @@ func (r *Raft) runFollower(ch <-chan RPC) {
 			}
 		case <-randomTimeout(r.config.HeartbeatTimeout):
 			// 時間切れでcandidateへstateの変更
-			r.state = Candidate
+			r.setState(Candidate)
 		case <-r.shutdownCh:
 			return
 		}
 	}
 }
 
-func (r *Raft) runCandidate(ch <-chan RPC) {
+func (r *Raft) runCandidate() {
 	logrus.Print("run candidate")
 	voteCh := r.electSelf()
 	electionTimer := randomTimeout(r.config.ElectionTimeout)
@@ -214,7 +212,7 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 	transition := false
 	for !transition {
 		select {
-		case rpc := <-ch:
+		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
 				r.appendEntries(rpc, cmd)
@@ -230,10 +228,8 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 			// termの確認
 			if vote.Term > r.getCurrentTerm() {
 				logrus.Printf("newer term discovered")
-				r.state = Follower
-				if err := r.setCurrentTerm(vote.Term); err != nil {
-					logrus.Printf("fail to update current term: %v", err)
-				}
+				r.setState(Follower)
+				r.setCurrentTerm(vote.Term)
 				return
 			}
 			// grantedな投票の票数確認
@@ -245,7 +241,7 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 			// 過半数表を得ているか。leaderになり得るか
 			if grantedVotes >= votesNeeded {
 				logrus.Printf("election won. tally: %d", grantedVotes)
-				r.state = Leader
+				r.setState(Leader)
 			}
 		case <-electionTimer:
 			logrus.Printf("election timeout reached, restarting election")
@@ -287,10 +283,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 		}
 	}
 	// increment term
-	if err := r.setCurrentTerm(r.currentTerm + 1); err != nil {
-		logrus.Printf("fail to get last log: %d %v", r.lastLog, err)
-		return nil
-	}
+	r.setCurrentTerm(r.currentTerm + 1)
 	req := &RequestVoteRequest{
 		Term:         r.getCurrentTerm(),
 		CandidateID:  r.CandidateID(),
@@ -314,15 +307,6 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 
 	respCh <- &RequestVoteResponse{Term: req.Term, VoteGranted: true}
 	return respCh
-}
-
-func (r *Raft) setCurrentTerm(t uint64) error {
-	r.currentTerm = t
-	return nil
-}
-
-func (r *Raft) getCurrentTerm() uint64 {
-	return r.currentTerm
 }
 
 func (r *Raft) CandidateID() string {

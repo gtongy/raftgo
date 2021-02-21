@@ -48,22 +48,22 @@ func (r *raftState) getLastLog() uint64 {
 	return atomic.LoadUint64(&r.lastLog)
 }
 
-func (r *raftState) setLastLog(term uint64) {
-	atomic.StoreUint64(&r.lastLog, term)
+func (r *raftState) setLastLog(lastLog uint64) {
+	atomic.StoreUint64(&r.lastLog, lastLog)
 }
 
 func (r *raftState) getCommitIndex() uint64 {
 	return atomic.LoadUint64(&r.commitIndex)
 }
 
-func (r *raftState) setCommitIndex(term uint64) {
-	atomic.StoreUint64(&r.commitIndex, term)
+func (r *raftState) setCommitIndex(commitIndex uint64) {
+	atomic.StoreUint64(&r.commitIndex, commitIndex)
 }
 
 func (r *raftState) getLastApplied() uint64 {
 	return atomic.LoadUint64(&r.lastApplied)
 }
 
-func (r *raftState) setLastApplied(term uint64) {
-	atomic.StoreUint64(&r.lastApplied, term)
+func (r *raftState) setLastApplied(lastApplied uint64) {
+	atomic.StoreUint64(&r.lastApplied, lastApplied)
 }
