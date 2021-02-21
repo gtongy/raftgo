@@ -1,26 +1,45 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"sync"
+)
+
+var (
+	keyCurrentTerm  = []byte("CurrentTerm")
+	keyLastVoteTerm = []byte("LastVoteTerm")
+	keyLastVoteCand = []byte("LastVoteCand")
 )
 
 type Raft struct {
 	state        RaftState
 	config       *Config
-	lastLog      int64
+	lastLog      uint64
 	logs         LogStore
-	currentTerm  int64
+	currentTerm  uint64
 	rpcCh        chan RPC
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
+	stable       StableStore
 }
 
-func NewRaft() (*Raft, error) {
+func NewRaft(stable StableStore, logs LogStore) (*Raft, error) {
+	lastLog, err := logs.LastIndex()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to find last log: %v", err)
+	}
+	currentTerm, err := stable.GetUint64(keyCurrentTerm)
+	if err != nil && err.Error() != "not found" {
+		return nil, err
+	}
 	r := &Raft{
-		state:      Follower,
-		config:     DefaultConfig(),
-		shutdownCh: make(chan struct{}),
+		state:       Follower,
+		lastLog:     lastLog,
+		config:      DefaultConfig(),
+		stable:      stable,
+		currentTerm: currentTerm,
+		shutdownCh:  make(chan struct{}),
 	}
 	go r.run()
 	return r, nil
@@ -58,6 +77,7 @@ func (r *Raft) runFollower() {
 				r.followerAppendEntries(rpc, cmd)
 				return
 			case *RequestVoteRequest:
+				r.followerRequestVote(rpc, cmd)
 				return
 			default:
 				log.Printf("follower unexpected type %#v", rpc.Command)
@@ -76,6 +96,7 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 		Term:    r.currentTerm,
 		Success: false,
 	}
+	// TODO: respond
 	// old term skip
 	if a.Term < r.currentTerm {
 		return
@@ -108,7 +129,68 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.lastLog = entry.Index
 	}
 }
-func (r *Raft) followerRequestVoteRequest(rpc RPC, a *AppendEntriesRequest) {}
+func (r *Raft) followerRequestVote(rpc RPC, req *RequestVoteRequest) {
+	resp := &RequestVoteResponse{
+		Term:        r.currentTerm,
+		VoteGranted: false,
+	}
+	// TODO: respond
+	// old term skip
+	if req.Term < r.currentTerm {
+		return
+	}
+	if req.Term > r.currentTerm {
+		r.currentTerm = req.Term
+		resp.Term = req.Term
+	}
+
+	// check voted
+	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+	if err != nil && err.Error() != "not found" {
+		log.Printf("fail to get last vote %v", err)
+		return
+	}
+	lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
+	if err != nil && err.Error() != "not found" {
+		log.Printf("fail to get last vote candidate %v", err)
+		return
+	}
+	// check voted in this election before
+	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
+		log.Printf("duplicate RequestVote for same term %d", req.Term)
+		if string(lastVoteCandBytes) == req.CandidateID {
+			log.Printf("duplicate RequestVote from candidate: %s", req.CandidateID)
+			resp.VoteGranted = true
+		}
+		return
+	}
+	if r.lastLog > 0 {
+		var lastLog Log
+		if err := r.logs.GetLog(r.lastLog, &lastLog); err != nil {
+			log.Printf("fail to get last log %v", err)
+			return
+		}
+		if lastLog.Term > req.LastLogTerm {
+			log.Printf("reject vote since our last term is greater")
+			return
+		}
+		if lastLog.Index > req.LastLogIndex {
+			log.Printf("reject vote since our last index is greater")
+			return
+		}
+	}
+
+	// Seems we should grant a vote
+	if err := r.stable.SetUint64(keyLastVoteTerm, req.Term); err != nil {
+		log.Printf("[ERR] Failed to persist last vote term: %v", err)
+		return
+	}
+	if err := r.stable.Set(keyLastVoteCand, []byte(req.CandidateID)); err != nil {
+		log.Printf("[ERR] Failed to persist last vote candidate: %v", err)
+		return
+	}
+	resp.VoteGranted = true
+}
 
 func (r *Raft) runCandidate() {
 	for {

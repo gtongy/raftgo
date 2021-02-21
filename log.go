@@ -7,14 +7,15 @@ const (
 )
 
 type Log struct {
-	Index int64
-	Term  int64
+	Index uint64
+	Term  uint64
 	Type  LogType
 	Data  []byte
 }
 
 type LogStore interface {
-	GetLog(index int64, log *Log) error
-	DeleteRange(index int64, lastLog int64) error
+	GetLog(index uint64, log *Log) error
+	DeleteRange(index uint64, lastLog uint64) error
 	StoreLog(*Log) error
+	LastIndex() (uint64, error)
 }

@@ -3,10 +3,14 @@ package main
 import "time"
 
 func main() {
-	r, err := NewRaft()
+	store, err := NewLevelDBStore(".")
+	if err != nil {
+		panic(err)
+	}
+	r, err := NewRaft(store, store)
 	if err != nil {
 		panic(err)
 	}
 	defer r.Shutdown()
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(2000 * time.Millisecond)
 }
