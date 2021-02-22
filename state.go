@@ -1,6 +1,8 @@
 package main
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+)
 
 const (
 	Follower RaftState = iota
@@ -19,11 +21,11 @@ type StableStore interface {
 }
 
 type raftState struct {
-	state       RaftState
-	currentTerm uint64
-	lastLog     uint64
-	commitIndex uint64
-	lastApplied uint64
+	state           RaftState
+	currentTerm     uint64
+	lastLog         uint64
+	commitIndex     uint64
+	lastApplied     uint64
 }
 
 func (r *raftState) getState() RaftState {

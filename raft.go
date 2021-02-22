@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 
@@ -21,14 +22,24 @@ type Raft struct {
 	logs         LogStore
 	currentTerm  uint64
 	peers        []net.Addr
+	rpcCh        <-chan RPC
 	trans        Transport
 	shutdownCh   chan struct{}
-	rpcCh        chan RPC
+	leaderCh     chan bool
+	fsm          FSM
 	shutdownLock sync.Mutex
 	stable       StableStore
 }
 
-func NewRaft(stable StableStore, logs LogStore, trans Transport) (*Raft, error) {
+func (r *Raft) State() RaftState {
+	return r.getState()
+}
+
+func (r *Raft) LeaderCh() <-chan bool {
+	return r.leaderCh
+}
+
+func NewRaft(config *Config, fsm FSM, logs LogStore, stable StableStore, peers []net.Addr, trans Transport) (*Raft, error) {
 	lastLog, err := logs.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to find last log: %v", err)
@@ -38,14 +49,16 @@ func NewRaft(stable StableStore, logs LogStore, trans Transport) (*Raft, error) 
 		return nil, err
 	}
 	r := &Raft{
-		config:      DefaultConfig(),
-		lastLog:     lastLog,
-		logs:        logs,
-		currentTerm: currentTerm,
-		peers:       make([]net.Addr, 0, 5),
-		trans:       trans,
-		shutdownCh:  make(chan struct{}),
-		stable:      stable,
+		config:     config,
+		lastLog:    lastLog,
+		logs:       logs,
+		peers:      peers,
+		rpcCh:      trans.Consumer(),
+		trans:      trans,
+		shutdownCh: make(chan struct{}),
+		fsm:        fsm,
+		leaderCh:   make(chan bool, 1),
+		stable:     stable,
 	}
 	r.setState(Follower)
 	r.setCurrentTerm(currentTerm)
@@ -177,8 +190,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 }
 
 func (r *Raft) runFollower() {
+	logrus.Print("run follower")
 	for {
-		logrus.Print("run follower")
 		select {
 		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
@@ -193,8 +206,10 @@ func (r *Raft) runFollower() {
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 		case <-randomTimeout(r.config.HeartbeatTimeout):
+			logrus.Info("heartbeat timeout reached, starting election")
 			// 時間切れでcandidateへstateの変更
 			r.setState(Candidate)
+			return
 		case <-r.shutdownCh:
 			return
 		}
@@ -242,6 +257,7 @@ func (r *Raft) runCandidate() {
 			if grantedVotes >= votesNeeded {
 				logrus.Printf("election won. tally: %d", grantedVotes)
 				r.setState(Leader)
+				return
 			}
 		case <-electionTimer:
 			logrus.Printf("election timeout reached, restarting election")
@@ -254,9 +270,25 @@ func (r *Raft) runCandidate() {
 }
 
 func (r *Raft) runLeader() {
-	for {
-		logrus.Print("run leader")
+	transition := false
+	logrus.Print("run leader")
+	asyncNotifyBool(r.leaderCh, true)
+	defer func() {
+		asyncNotifyBool(r.leaderCh, false)
+	}()
+	for !transition {
 		select {
+		case rpc := <-r.rpcCh:
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				r.appendEntries(rpc, cmd)
+			case *RequestVoteRequest:
+				r.requestVote(rpc, cmd)
+			default:
+				log.Printf("leader state, got unexpected command: %#v",
+					rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
 		case <-r.shutdownCh:
 			return
 		}
