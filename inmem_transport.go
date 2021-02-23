@@ -49,3 +49,8 @@ func (i *InmemTransport) RequestVote(peer net.Addr, req *RequestVoteRequest, res
 	// TODO
 	return nil
 }
+
+func (i *InmemTransport) AppendEntries(peer net.Addr, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {
+	// TODO
+	return nil
+}

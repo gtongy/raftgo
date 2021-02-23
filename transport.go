@@ -9,7 +9,7 @@ type RPCResponse struct {
 
 type AppendEntriesRequest struct {
 	Term         uint64
-	LeaderID     uint64
+	LeaderID     string
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
 	Entries      []*Log
@@ -42,4 +42,5 @@ func (r *RPC) Respond(resp interface{}, err error) {
 type Transport interface {
 	Consumer() <-chan RPC
 	RequestVote(peer net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error
+	AppendEntries(peer net.Addr, req *AppendEntriesRequest, resp *AppendEntriesResponse) error
 }

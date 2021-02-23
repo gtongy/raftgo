@@ -294,6 +294,18 @@ func (r *Raft) runCandidate() {
 }
 
 func (r *Raft) runLeader() {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	triggers := make([]chan struct{}, 0, len(r.peers))
+	for i := 0; i < len(r.peers); i++ {
+		triggers = append(triggers, make(chan struct{}))
+	}
+
+	for i, peer := range r.peers {
+		go r.replicate(triggers[i], stopCh, peer)
+	}
+
 	transition := false
 	logrus.Print("run leader")
 	asyncNotifyBool(r.leaderCh, true)
@@ -316,6 +328,36 @@ func (r *Raft) runLeader() {
 		case <-r.shutdownCh:
 			return
 		}
+	}
+}
+
+func (r *Raft) replicate(triggerCh, stopCh chan struct{}, peer net.Addr) {
+	timeout := time.After(time.Microsecond)
+	for {
+		select {
+		case <-timeout:
+			timeout = randomTimeout(r.config.CommitTimeout)
+			r.heartbeat(peer)
+		case <-stopCh:
+			return
+		}
+	}
+}
+
+func (r *Raft) heartbeat(peer net.Addr) {
+	// TODO: cache prev log entry, prev log term
+	var prevLogIndex, prevLogTerm uint64
+	prevLogIndex, prevLogTerm = 0, 0
+	req := AppendEntriesRequest{
+		Term:         r.getCurrentTerm(),
+		LeaderID:     r.CandidateID(),
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: r.commitIndex,
+	}
+	var resp AppendEntriesResponse
+	if err := r.trans.AppendEntries(peer, &req, &resp); err != nil {
+		log.Printf("failed to heartbeat with %v, %v", peer, err)
 	}
 }
 
@@ -366,6 +408,5 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 }
 
 func (r *Raft) CandidateID() string {
-	// TODO
-	return "uuid"
+	return generateUUID()
 }
