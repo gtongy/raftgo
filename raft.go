@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -17,6 +18,8 @@ var (
 
 type Raft struct {
 	raftState
+	// manage commands to be applied
+	applyCh      chan *logFuture
 	config       *Config
 	lastLog      uint64
 	logs         LogStore
@@ -49,6 +52,7 @@ func NewRaft(config *Config, fsm FSM, logs LogStore, stable StableStore, peers [
 		return nil, err
 	}
 	r := &Raft{
+		applyCh:    make(chan *logFuture),
 		config:     config,
 		lastLog:    lastLog,
 		logs:       logs,
@@ -65,6 +69,26 @@ func NewRaft(config *Config, fsm FSM, logs LogStore, stable StableStore, peers [
 	r.setLastLog(lastLog)
 	go r.run()
 	return r, nil
+}
+
+func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+	logFuture := &logFuture{
+		log: Log{
+			Type: LogCommand,
+			Data: cmd,
+		},
+		errCh: make(chan error, 1),
+	}
+	select {
+	case <-timer:
+		return errorFuture{fmt.Errorf("timeout enqueuing operation")}
+	case r.applyCh <- logFuture:
+		return logFuture
+	}
 }
 
 func (r *Raft) run() {
