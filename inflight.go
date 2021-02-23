@@ -1,0 +1,65 @@
+package main
+
+import "sync"
+
+type inflight struct {
+	sync.Mutex
+	commitCh   chan *logFuture
+	operations map[uint64]*inflightLog
+}
+
+type inflightLog struct {
+	future      *logFuture
+	commitCount int
+	quorum      int
+}
+
+func NewInflight(commitCh chan *logFuture) *inflight {
+	return &inflight{
+		commitCh:   commitCh,
+		operations: make(map[uint64]*inflightLog),
+	}
+}
+
+func (i *inflight) Start(l *logFuture, quorum int) {
+	i.Lock()
+	defer i.Unlock()
+	op := &inflightLog{
+		future:      l,
+		commitCount: 0,
+		quorum:      quorum,
+	}
+	i.operations[l.log.Index] = op
+}
+
+func (i *inflight) Commit(index uint64) {
+	i.Lock()
+	defer i.Unlock()
+
+	op, ok := i.operations[index]
+	if !ok {
+		// ignore if not exists
+		return
+	}
+
+	op.commitCount++
+
+	// check if we have commit this
+	if op.commitCount < op.quorum {
+		return
+	}
+
+	delete(i.operations, index)
+	i.commitCh <- op.future
+}
+
+func (i *inflight) Cancel(err error) {
+	i.Lock()
+	defer i.Unlock()
+
+	for _, op := range i.operations {
+		op.future.respond(err)
+	}
+
+	i.operations = make(map[uint64]*inflightLog)
+}
