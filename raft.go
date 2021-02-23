@@ -58,12 +58,19 @@ func NewRaft(config *Config, fsm FSM, logs LogStore, stable StableStore, peers [
 	if err != nil && err.Error() != "not found" {
 		return nil, err
 	}
+	localAddr := trans.LocalAddr()
+	otherPeers := make([]net.Addr, 0, len(peers))
+	for _, p := range peers {
+		if p.String() != localAddr.String() {
+			otherPeers = append(otherPeers, p)
+		}
+	}
 	r := &Raft{
 		applyCh:     make(chan *logFuture),
 		config:      config,
 		lastLog:     lastLog,
 		logs:        logs,
-		peers:       peers,
+		peers:       otherPeers,
 		rpcCh:       trans.Consumer(),
 		trans:       trans,
 		shutdownCh:  make(chan struct{}),
@@ -298,6 +305,8 @@ func (r *Raft) runCandidate() {
 				r.setState(Leader)
 				return
 			}
+		case a := <-r.applyCh:
+			a.respond(fmt.Errorf("not leader"))
 		case <-electionTimer:
 			logrus.Printf("election timeout reached, restarting election")
 			return
@@ -412,14 +421,14 @@ func (r *Raft) Shutdown() {
 func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 	respCh := make(chan *RequestVoteResponse, len(r.peers)+1)
 	var lastLog Log
-	if r.lastLog > 0 {
-		if err := r.logs.GetLog(r.lastLog, &lastLog); err != nil {
+	if r.getLastLog() > 0 {
+		if err := r.logs.GetLog(r.getLastLog(), &lastLog); err != nil {
 			logrus.Printf("failed to get last log: %d %v", r.lastLog, err)
 			return nil
 		}
 	}
 	// increment term
-	r.setCurrentTerm(r.currentTerm + 1)
+	r.setCurrentTerm(r.getCurrentTerm() + 1)
 	req := &RequestVoteRequest{
 		Term:         r.getCurrentTerm(),
 		CandidateID:  r.CandidateID(),
@@ -441,8 +450,22 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 		go askPeer(peer)
 	}
 
+	if err := r.persistVote(req.Term, req.CandidateID); err != nil {
+		logrus.Printf("fail to persist vote: %v", err)
+	}
+
 	respCh <- &RequestVoteResponse{Term: req.Term, VoteGranted: true}
 	return respCh
+}
+
+func (r *Raft) persistVote(term uint64, candidateID string) error {
+	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
+		return err
+	}
+	if err := r.stable.Set(keyLastVoteCand, []byte(candidateID)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Raft) runFSM() {
