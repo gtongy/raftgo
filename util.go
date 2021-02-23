@@ -33,3 +33,12 @@ func asyncNotifyBool(ch chan bool, v bool) {
 	default:
 	}
 }
+
+func asyncNotify(chans []chan struct{}) {
+	for _, ch := range chans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}

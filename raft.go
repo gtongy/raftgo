@@ -16,6 +16,11 @@ var (
 	keyLastVoteCand = []byte("LastVoteCand")
 )
 
+type commitTuple struct {
+	index  uint64
+	future *logFuture
+}
+
 type Raft struct {
 	raftState
 	// manage commands to be applied
@@ -30,6 +35,8 @@ type Raft struct {
 	shutdownCh   chan struct{}
 	leaderCh     chan bool
 	fsm          FSM
+	commitCh     chan commitTuple
+	commitIndex  uint64
 	shutdownLock sync.Mutex
 	stable       StableStore
 }
@@ -52,22 +59,25 @@ func NewRaft(config *Config, fsm FSM, logs LogStore, stable StableStore, peers [
 		return nil, err
 	}
 	r := &Raft{
-		applyCh:    make(chan *logFuture),
-		config:     config,
-		lastLog:    lastLog,
-		logs:       logs,
-		peers:      peers,
-		rpcCh:      trans.Consumer(),
-		trans:      trans,
-		shutdownCh: make(chan struct{}),
-		fsm:        fsm,
-		leaderCh:   make(chan bool, 1),
-		stable:     stable,
+		applyCh:     make(chan *logFuture),
+		config:      config,
+		lastLog:     lastLog,
+		logs:        logs,
+		peers:       peers,
+		rpcCh:       trans.Consumer(),
+		trans:       trans,
+		shutdownCh:  make(chan struct{}),
+		fsm:         fsm,
+		commitCh:    make(chan commitTuple, 128),
+		commitIndex: 0,
+		leaderCh:    make(chan bool, 1),
+		stable:      stable,
 	}
 	r.setState(Follower)
 	r.setCurrentTerm(currentTerm)
 	r.setLastLog(lastLog)
 	go r.run()
+	go r.runFSM()
 	return r, nil
 }
 
@@ -240,14 +250,19 @@ func (r *Raft) runFollower() {
 	}
 }
 
+func (r *Raft) quorumSize() int {
+	clusterSize := len(r.peers) + 1
+	// 過半数以上獲得が必要
+	votesNeeded := (clusterSize / 2) + 1
+	return votesNeeded
+}
+
 func (r *Raft) runCandidate() {
 	logrus.Print("run candidate")
 	voteCh := r.electSelf()
 	electionTimer := randomTimeout(r.config.ElectionTimeout)
 	grantedVotes := 0
-	clusterSize := len(r.peers) + 1
-	votesNeeded := (clusterSize >> 1) + 1
-	logrus.Printf("cluster size: %d, votes needed: %d", clusterSize, votesNeeded)
+	votesNeeded := r.quorumSize()
 	transition := false
 	for !transition {
 		select {
@@ -306,14 +321,37 @@ func (r *Raft) runLeader() {
 		go r.replicate(triggers[i], stopCh, peer)
 	}
 
-	transition := false
 	logrus.Print("run leader")
 	asyncNotifyBool(r.leaderCh, true)
 	defer func() {
 		asyncNotifyBool(r.leaderCh, false)
 	}()
-	for !transition {
+	commitCh := make(chan *logFuture)
+	inflight := NewInflight(commitCh)
+	r.leaderLoop(inflight, commitCh, r.rpcCh, triggers)
+}
+
+func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh <-chan RPC, triggers []chan struct{}) {
+	for r.getState() == Leader {
 		select {
+		case applyLog := <-r.applyCh:
+			applyLog.log.Index = r.lastLog + 1
+			applyLog.log.Term = r.getCurrentTerm()
+			if err := r.logs.StoreLog(&applyLog.log); err != nil {
+				logrus.Printf("fail to commit log: %v", err)
+				applyLog.respond(err)
+				r.setState(Follower)
+				return
+			}
+			r.lastLog++
+			inflight.Start(applyLog, r.quorumSize())
+			asyncNotify(triggers)
+		case commitLog := <-commitCh:
+			r.commitIndex = commitLog.log.Index
+			r.commitCh <- commitTuple{
+				index:  commitLog.log.Index,
+				future: commitLog,
+			}
 		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
@@ -405,6 +443,33 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 
 	respCh <- &RequestVoteResponse{Term: req.Term, VoteGranted: true}
 	return respCh
+}
+
+func (r *Raft) runFSM() {
+	for {
+		select {
+		case commitTuple := <-r.commitCh:
+			var l *Log
+			if commitTuple.future != nil {
+				l = &commitTuple.future.log
+			} else {
+				l = new(Log)
+				if err := r.logs.GetLog(commitTuple.index, l); err != nil {
+					logrus.Printf("fail to get log: %v", err)
+					panic(err)
+				}
+			}
+			if l.Type == LogCommand {
+				r.fsm.Apply(l.Data)
+			}
+			// invoke the future if given
+			if commitTuple.future != nil {
+				commitTuple.future.respond(nil)
+			}
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 func (r *Raft) CandidateID() string {
