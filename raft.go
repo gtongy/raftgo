@@ -14,6 +14,7 @@ var (
 	keyCurrentTerm  = []byte("CurrentTerm")
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
+	keyCandidateId  = []byte("CandidateId")
 )
 
 type commitTuple struct {
@@ -320,28 +321,29 @@ func (r *Raft) runCandidate() {
 func (r *Raft) runLeader() {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
-
+	commitCh := make(chan *logFuture)
+	inflight := NewInflight(commitCh)
 	triggers := make([]chan struct{}, 0, len(r.peers))
 	for i := 0; i < len(r.peers); i++ {
 		triggers = append(triggers, make(chan struct{}))
 	}
 
 	for i, peer := range r.peers {
-		go r.replicate(triggers[i], stopCh, peer)
+		go r.replicate(inflight, triggers[i], stopCh, peer)
 	}
+
+	go r.applyNoop()
 
 	logrus.Print("run leader")
 	asyncNotifyBool(r.leaderCh, true)
 	defer func() {
 		asyncNotifyBool(r.leaderCh, false)
 	}()
-	commitCh := make(chan *logFuture)
-	inflight := NewInflight(commitCh)
 	r.leaderLoop(inflight, commitCh, r.rpcCh, triggers)
 }
 
 func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh <-chan RPC, triggers []chan struct{}) {
-	for r.getState() == Leader {
+	for {
 		select {
 		case applyLog := <-r.applyCh:
 			applyLog.log.Index = r.lastLog + 1
@@ -352,8 +354,10 @@ func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh 
 				r.setState(Follower)
 				return
 			}
-			r.lastLog++
+
 			inflight.Start(applyLog, r.quorumSize())
+			inflight.Commit(applyLog.log.Index)
+			r.setLastLog(applyLog.log.Index)
 			asyncNotify(triggers)
 		case commitLog := <-commitCh:
 			r.commitIndex = commitLog.log.Index
@@ -378,34 +382,99 @@ func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh 
 	}
 }
 
-func (r *Raft) replicate(triggerCh, stopCh chan struct{}, peer net.Addr) {
-	timeout := time.After(time.Microsecond)
-	for {
+func (r *Raft) applyNoop() {
+	logFuture := &logFuture{
+		log: Log{
+			Type: LogNoop,
+		},
+	}
+	r.applyCh <- logFuture
+}
+
+type followerReplication struct {
+	matchIndex uint64
+	nextIndex  uint64
+}
+
+func (r *Raft) replicate(inflight *inflight, triggerCh, stopCh chan struct{}, peer net.Addr) {
+	last := r.getLastLog()
+	indexes := followerReplication{
+		matchIndex: last,
+		nextIndex:  last + 1,
+	}
+	shouldStop := false
+	for !shouldStop {
 		select {
-		case <-timeout:
-			timeout = randomTimeout(r.config.CommitTimeout)
-			r.heartbeat(peer)
+		case <-triggerCh:
+			shouldStop = r.replicateTo(inflight, &indexes, r.getLastLog(), peer)
+		case <-randomTimeout(r.config.CommitTimeout):
+			shouldStop = r.replicateTo(inflight, &indexes, r.getLastLog(), peer)
 		case <-stopCh:
 			return
 		}
 	}
 }
 
-func (r *Raft) heartbeat(peer net.Addr) {
-	// TODO: cache prev log entry, prev log term
-	var prevLogIndex, prevLogTerm uint64
-	prevLogIndex, prevLogTerm = 0, 0
-	req := AppendEntriesRequest{
+func (r *Raft) replicateTo(inflight *inflight, indexes *followerReplication, lastIndex uint64, peer net.Addr) (shouldStop bool) {
+	var l Log
+	var req AppendEntriesRequest
+	var resp AppendEntriesResponse
+START:
+	req = AppendEntriesRequest{
 		Term:         r.getCurrentTerm(),
 		LeaderID:     r.CandidateID(),
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		LeaderCommit: r.commitIndex,
+		LeaderCommit: 0,
 	}
-	var resp AppendEntriesResponse
+
+	// get previous log entry based on the next index
+	if indexes.nextIndex > 1 {
+		if err := r.logs.GetLog(indexes.nextIndex-1, &l); err != nil {
+			logrus.Printf("fail to get log at index %d: %v", indexes.nextIndex-1, err)
+			return
+		}
+	}
+	req.PrevLogIndex = l.Index
+	req.PrevLogTerm = l.Term
+
+	// Append up to MaxAppendEntries or up to the lastIndex
+	req.Entries = make([]*Log, 0, 16)
+	// NOTE: digging
+	maxIndex := min(indexes.nextIndex+uint64(r.config.MaxAppendEntries)-1, lastIndex)
+	for i := indexes.nextIndex; i <= maxIndex; i++ {
+		oldLog := new(Log)
+		if err := r.logs.GetLog(i, oldLog); err != nil {
+			logrus.Printf("fail to get log at index %d: %v", i, err)
+			return
+		}
+		req.Entries = append(req.Entries, oldLog)
+	}
+
+	// make rpc call
 	if err := r.trans.AppendEntries(peer, &req, &resp); err != nil {
-		log.Printf("failed to heartbeat with %v, %v", peer, err)
+		logrus.Printf("fail to AppendEntries to %v: %v", peer, err)
+		return
 	}
+	// check newer term
+	if resp.Term > req.Term {
+		return true
+	}
+	if resp.Success {
+		for i := indexes.matchIndex; i <= maxIndex; i++ {
+			inflight.Commit(i)
+		}
+		indexes.matchIndex = maxIndex
+		indexes.nextIndex = maxIndex + 1
+	} else {
+		logrus.Printf("AppendEntries to %v rejected, sending older logs", peer)
+		indexes.nextIndex--
+		indexes.matchIndex = indexes.nextIndex - 1
+	}
+
+	// check if there are more logs to replicate
+	if indexes.nextIndex <= lastIndex {
+		goto START
+	}
+	return
 }
 
 func (r *Raft) Shutdown() {
@@ -496,5 +565,19 @@ func (r *Raft) runFSM() {
 }
 
 func (r *Raft) CandidateID() string {
-	return generateUUID()
+	// Get the persistent id
+	raw, err := r.stable.Get(keyCandidateId)
+	if err == nil {
+		return string(raw)
+	}
+
+	// Generate a UUID on the first call
+	if err != nil && err.Error() == "not found" {
+		id := generateUUID()
+		if err := r.stable.Set(keyCandidateId, []byte(id)); err != nil {
+			panic(fmt.Errorf("Failed to write CandidateId: %v", err))
+		}
+		return id
+	}
+	panic(fmt.Errorf("Failed to read CandidateId: %v", err))
 }

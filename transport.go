@@ -41,6 +41,7 @@ func (r *RPC) Respond(resp interface{}, err error) {
 
 type Transport interface {
 	Consumer() <-chan RPC
+	LocalAddr() net.Addr
 	RequestVote(peer net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error
 	AppendEntries(peer net.Addr, req *AppendEntriesRequest, resp *AppendEntriesResponse) error
 }

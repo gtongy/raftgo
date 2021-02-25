@@ -16,8 +16,10 @@ func (m *MockFSM) Apply(log []byte) {
 
 func inmemConfig() *Config {
 	return &Config{
-		HeartbeatTimeout: 5 * time.Millisecond,
-		ElectionTimeout:  10 * time.Millisecond,
+		HeartbeatTimeout: 500 * time.Millisecond,
+		ElectionTimeout:  500 * time.Millisecond,
+		CommitTimeout:    50 * time.Millisecond,
+		MaxAppendEntries: 16,
 	}
 }
 

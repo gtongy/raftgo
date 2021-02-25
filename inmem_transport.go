@@ -44,6 +44,10 @@ func (i *InmemTransport) Consumer() <-chan RPC {
 	return i.consumerCh
 }
 
+func (i *InmemTransport) LocalAddr() net.Addr {
+	return i.localAddr
+}
+
 // RequestVote implements the Transport interface.
 func (i *InmemTransport) RequestVote(peer net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error {
 	// TODO

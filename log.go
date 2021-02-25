@@ -4,6 +4,8 @@ type LogType uint8
 
 const (
 	LogCommand LogType = iota
+	// Noop is used to assert leadership
+	LogNoop
 )
 
 type Log struct {
