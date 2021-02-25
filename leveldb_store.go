@@ -60,18 +60,19 @@ func NewLevelDBStore(base string) (*LevelDBStore, error) {
 }
 
 func (l *LevelDBStore) Close() error {
-	err1 := l.logs.Close()
-	err2 := l.conf.Close()
-	if err1 == nil && err2 == nil {
-		return nil
-	} else if err1 == nil && err2 != nil {
-		return err2
-	} else if err1 != nil && err2 == nil {
-		return err1
-	} else {
-		return fmt.Errorf("Failed to close DB: Got: %v and %v",
-			err1, err2)
-	}
+	//err1 := l.logs.Close()
+	//err2 := l.conf.Close()
+	//if err1 == nil && err2 == nil {
+	//	return nil
+	//} else if err1 == nil && err2 != nil {
+	//	return err2
+	//} else if err1 != nil && err2 == nil {
+	//	return err1
+	//} else {
+	//	return fmt.Errorf("Failed to close DB: Got: %v and %v",
+	//		err1, err2)
+	//}
+	return nil
 }
 
 func (l *LevelDBStore) LastIndex() (uint64, error) {

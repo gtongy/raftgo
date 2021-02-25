@@ -15,6 +15,7 @@ var (
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
 	keyCandidateId  = []byte("CandidateId")
+	LeadershipLost  = fmt.Errorf("leadership lost while committing log")
 )
 
 type commitTuple struct {
@@ -127,47 +128,82 @@ func (r *Raft) run() {
 	}
 }
 
-func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool) {
+	// Setup a response
 	resp := &AppendEntriesResponse{
-		Term:    r.currentTerm,
+		Term:    r.getCurrentTerm(),
 		Success: false,
 	}
 	var rpcErr error
 	defer rpc.Respond(resp, rpcErr)
-	// old term skip
-	if a.Term < r.currentTerm {
+
+	// Ignore an older term
+	if a.Term < r.getCurrentTerm() {
 		return
 	}
-	if a.Term > r.currentTerm {
-		r.currentTerm = a.Term
+
+	// Increase the term if we see a newer one, also transition to follower
+	// if we ever get an appendEntries call
+	if a.Term > r.getCurrentTerm() || r.getState() != Follower {
+		r.setCurrentTerm(a.Term)
 		resp.Term = a.Term
+
+		// Ensure transition to follower
+		transition = true
+		r.setState(Follower)
 	}
+
+	// Verify the last log entry
 	var prevLog Log
-	if err := r.logs.GetLog(a.PrevLogIndex, &prevLog); err != nil {
-		logrus.Printf("failed to get prev log: %d %v", a.PrevLogIndex, err)
-		return
+	if a.PrevLogIndex > 0 {
+		if err := r.logs.GetLog(a.PrevLogIndex, &prevLog); err != nil {
+			log.Printf("[WARN] Failed to get previous log: %d %v",
+				a.PrevLogIndex, err)
+			return
+		}
+		if a.PrevLogTerm != prevLog.Term {
+			log.Printf("[WARN] Previous log term mis-match: ours: %d remote: %d",
+				prevLog.Term, a.PrevLogTerm)
+			return
+		}
 	}
-	if a.PrevLogTerm != prevLog.Term {
-		logrus.Printf("prev log term mis match: ours: %d remote: %v", prevLog.Term, a.PrevLogTerm)
-		return
-	}
+
+	// Add all the entries
 	for _, entry := range a.Entries {
-		if entry.Index <= r.lastLog {
-			logrus.Printf("clear log suffix from %d to %d", entry.Index, r.lastLog)
-			if err := r.logs.DeleteRange(entry.Index, r.lastLog); err != nil {
-				logrus.Printf("fail to clear log")
+		// Delete any conflicting entries
+		if entry.Index <= r.getLastLog() {
+			log.Printf("[WARN] Clearing log suffix from %d to %d", entry.Index, r.getLastLog())
+			if err := r.logs.DeleteRange(entry.Index, r.getLastLog()); err != nil {
+				log.Printf("[ERR] Failed to clear log suffix: %v", err)
 				return
 			}
 		}
+
+		// Append the entry
 		if err := r.logs.StoreLog(entry); err != nil {
-			logrus.Printf("fail to append to log: %v", err)
+			log.Printf("[ERR] Failed to append to log: %v", err)
 			return
 		}
-		r.lastLog = entry.Index
+
+		// Update the lastLog
+		r.setLastLog(entry.Index)
 	}
+
+	// Update the commit index
+	if a.LeaderCommit > r.getCommitIndex() {
+		idx := min(a.LeaderCommit, r.getLastLog())
+		r.setCommitIndex(idx)
+
+		// Trigger applying logs locally
+		r.commitCh <- commitTuple{idx, nil}
+	}
+
+	// Everything went well, set success
+	resp.Success = true
+	return
 }
 
-func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 	resp := &RequestVoteResponse{
 		Term:        r.currentTerm,
 		VoteGranted: false,
@@ -229,6 +265,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 	resp.VoteGranted = true
+	return
 }
 
 func (r *Raft) runFollower() {
@@ -277,10 +314,10 @@ func (r *Raft) runCandidate() {
 		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
-				r.appendEntries(rpc, cmd)
+				transition = r.appendEntries(rpc, cmd)
 				return
 			case *RequestVoteRequest:
-				r.requestVote(rpc, cmd)
+				transition = r.requestVote(rpc, cmd)
 				return
 			default:
 				logrus.Printf("follower unexpected type %#v", rpc.Command)
@@ -321,8 +358,9 @@ func (r *Raft) runCandidate() {
 func (r *Raft) runLeader() {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
-	commitCh := make(chan *logFuture)
+	commitCh := make(chan *logFuture, 128)
 	inflight := NewInflight(commitCh)
+	defer inflight.Cancel(LeadershipLost)
 	triggers := make([]chan struct{}, 0, len(r.peers))
 	for i := 0; i < len(r.peers); i++ {
 		triggers = append(triggers, make(chan struct{}))
@@ -343,7 +381,8 @@ func (r *Raft) runLeader() {
 }
 
 func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh <-chan RPC, triggers []chan struct{}) {
-	for {
+	transition := false
+	for !transition {
 		select {
 		case applyLog := <-r.applyCh:
 			applyLog.log.Index = r.lastLog + 1
@@ -368,9 +407,9 @@ func (r *Raft) leaderLoop(inflight *inflight, commitCh <-chan *logFuture, rpcCh 
 		case rpc := <-r.rpcCh:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
-				r.appendEntries(rpc, cmd)
+				transition = r.appendEntries(rpc, cmd)
 			case *RequestVoteRequest:
-				r.requestVote(rpc, cmd)
+				transition = r.requestVote(rpc, cmd)
 			default:
 				log.Printf("leader state, got unexpected command: %#v",
 					rpc.Command)

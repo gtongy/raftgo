@@ -46,9 +46,19 @@ func TestRaft_SingleNode(t *testing.T) {
 		t.Fatalf("timeout becoming leader")
 	}
 
-	t.Log(raft.State())
 	// Should be leader
 	if s := raft.State(); s != Leader {
 		t.Fatalf("expected leader: %v", s)
+	}
+
+	// Should be able to apply
+	future := raft.Apply([]byte("test"), time.Millisecond)
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check that it is applied to the FSM
+	if len(fsm.logs) != 1 {
+		t.Fatalf("did not apply to FSM!")
 	}
 }

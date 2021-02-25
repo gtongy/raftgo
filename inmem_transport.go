@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"sync"
 )
@@ -49,12 +50,58 @@ func (i *InmemTransport) LocalAddr() net.Addr {
 }
 
 // RequestVote implements the Transport interface.
-func (i *InmemTransport) RequestVote(peer net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error {
-	// TODO
+func (i *InmemTransport) RequestVote(target net.Addr, req *RequestVoteRequest, resp *RequestVoteResponse) error {
+	i.RLock()
+	peer, ok := i.peers[target.String()]
+	i.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("Failed to connect to peer: %v", target)
+	}
+
+	// Send the RPC over
+	respCh := make(chan RPCResponse)
+	peer.consumerCh <- RPC{
+		Command:  req,
+		RespChan: respCh,
+	}
+
+	// Wait for a response
+	rpcResp := <-respCh
+	if rpcResp.Error != nil {
+		return rpcResp.Error
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*RequestVoteResponse)
+	*resp = *out
 	return nil
 }
 
-func (i *InmemTransport) AppendEntries(peer net.Addr, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {
-	// TODO
+func (i *InmemTransport) AppendEntries(target net.Addr, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {
+	i.RLock()
+	peer, ok := i.peers[target.String()]
+	i.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("Failed to connect to peer: %v", target)
+	}
+
+	// Send the RPC over
+	respCh := make(chan RPCResponse)
+	peer.consumerCh <- RPC{
+		Command:  req,
+		RespChan: respCh,
+	}
+
+	// Wait for a response
+	rpcResp := <-respCh
+	if rpcResp.Error != nil {
+		return rpcResp.Error
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*AppendEntriesResponse)
+	*resp = *out
 	return nil
 }
